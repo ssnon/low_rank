@@ -43,10 +43,30 @@ from transformers import (
 )
 from transformers.trainer_utils import get_last_checkpoint, is_main_process
 from transformers.utils import check_min_version
-
+from peft import (
+    get_peft_config,
+    get_peft_model,
+    get_peft_model_state_dict,
+    set_peft_model_state_dict,
+    LoraConfig,
+    PeftType,
+    PrefixTuningConfig,
+    PromptEncoderConfig,
+    prepare_model_for_kbit_training,
+)
+import wandb
+from wandb import AlertLevel
+import loralib as lora
+import copy
+import torch.nn as nn
+import math
+from typing import Any
+import peft
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
 check_min_version("4.4.0")
+
+num_heads = 24
 
 task_to_keys = {
     "cola": ("sentence", None),
@@ -221,6 +241,142 @@ class ModelArguments:
         default=0.0,
         metadata={"help": "Token Masking Probability"},
     )
+    ex_type: Optional[str] = field(
+        default=None,
+    )
+    
+def update_layer(self, adapter_name, r, lora_alpha, lora_dropout, init_lora_weights):
+    if r <= 0:
+        raise ValueError(f"`r` should be a positive integer value but the value passed is {r}")
+    self.r[adapter_name] = r
+    self.lora_alpha[adapter_name] = lora_alpha
+    if lora_dropout > 0.0:
+        lora_dropout_layer = nn.Dropout(p=lora_dropout)
+    else:
+        lora_dropout_layer = nn.Identity()
+
+    self.lora_dropout.update(nn.ModuleDict({adapter_name: lora_dropout_layer}))
+    # Actual trainable parameters
+    A_layers = nn.ModuleDict({})
+    B_layers = nn.ModuleDict({})
+    if r > 0:
+        in_f = self.in_features
+        out_f = int(self.out_features / num_heads)
+        for i in range(num_heads):
+            layerA = nn.Linear(in_f, r, bias=False)
+            layerB = nn.Linear(r, out_f, bias=False)
+            A_layers[f'{i}'] = layerA
+            B_layers[f'{i}'] = layerB
+                
+        self.lora_A[adapter_name] = A_layers
+        self.lora_B[adapter_name] = B_layers
+        self.scaling[adapter_name] = lora_alpha / r
+
+    if init_lora_weights == "loftq":
+        self.loftq_init(adapter_name)
+    elif init_lora_weights:
+        self.reset_lora_parameters(adapter_name, init_lora_weights)
+
+    weight = getattr(self.get_base_layer(), "weight", None)
+    if weight is not None:
+        # the layer is already completely initialized, this is an update
+        if weight.dtype.is_floating_point or weight.dtype.is_complex:
+            self.to(weight.device, dtype=weight.dtype)
+        else:
+            self.to(weight.device)
+    self.set_adapter(self.active_adapters)
+    
+def reset_lora_parameters(self, adapter_name, init_lora_weights):
+    if init_lora_weights is False:
+        return
+
+    if adapter_name in self.lora_A.keys():
+        for i in self.lora_A[adapter_name].keys():
+            if init_lora_weights is True:
+                # initialize A the same way as the default for nn.Linear and B to zero
+                # https://github.com/microsoft/LoRA/blob/a0a92e0f26c067cf94747bdbf1ce73793fa44d19/loralib/layers.py#L124
+                nn.init.kaiming_uniform_(self.lora_A[adapter_name][i].weight, a=math.sqrt(5))
+            elif init_lora_weights.lower() == "gaussian":
+                nn.init.normal_(self.lora_A[adapter_name][i].weight, std=1 / self.r[adapter_name])
+            else:
+                raise ValueError(f"Unknown initialization {init_lora_weights}")
+            nn.init.zeros_(self.lora_B[adapter_name][i].weight)
+    if adapter_name in self.lora_embedding_A.keys():
+        for i in self.lora_A[adapter_name].keys():
+            # initialize a the same way as the default for nn.linear and b to zero
+            nn.init.zeros_(self.lora_embedding_A[adapter_name][i])
+            nn.init.normal_(self.lora_embedding_B[adapter_name][i])
+
+def get_delta_weight(self, adapter) -> torch.Tensor:
+    device = self.lora_B[adapter].weight.device
+    dtype = self.lora_B[adapter].weight.dtype
+
+    # In case users wants to merge the adapter weights that are in
+    # float16 while being on CPU, we need to cast the weights to float32, perform the merge and then cast back to
+    # float16 because the `@` and matmul operation in general is not supported in torch + cpu + fp16.
+    cast_to_fp32 = device.type == "cpu" and dtype == torch.float16
+        
+    A_weight_dict = self.lora_A[adapter]
+    B_weight_dict = self.lora_B[adapter]
+    delta_weight_trunck = []
+    for i in A_weight_dict.keys():
+        weight_A = A_weight_dict[i].weight
+        weight_B = B_weight_dict[i].weight
+        delta_weight_trunck.append(weight_B @ weight_A)
+        
+    delta_weight = torch.cat(delta_weight_trunck, dim=2)
+
+    if cast_to_fp32:
+        weight_A = weight_A.float()
+        weight_B = weight_B.float()
+
+    output_tensor = transpose(delta_weight, self.fan_in_fan_out) * self.scaling[adapter]
+
+    if cast_to_fp32:
+        output_tensor = output_tensor.to(dtype=dtype)
+
+        # cast back the weights
+        self.lora_A[adapter].weight.data = weight_A.to(dtype)
+        self.lora_B[adapter].weight.data = weight_B.to(dtype)
+
+    return output_tensor    
+
+def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
+    previous_dtype = x.dtype
+
+    if self.disable_adapters:
+        if self.merged:
+            self.unmerge()
+        result = self.base_layer(x, *args, **kwargs)
+    elif self.merged:
+        result = self.base_layer(x, *args, **kwargs)
+    else:
+        result = self.base_layer(x, *args, **kwargs)
+        for active_adapter in self.active_adapters:
+            if active_adapter not in self.lora_A.keys():
+                continue
+            delta_weight_trunck = []
+            lora_A_dict = self.lora_A[active_adapter]
+            lora_B_dict = self.lora_B[active_adapter]
+            dropout = self.lora_dropout[active_adapter]
+            scaling = self.scaling[active_adapter]
+            for i in lora_A_dict.keys():
+                x = x.to(lora_A_dict[i].weight.dtype)
+                weight_A = lora_A_dict[i]
+                weight_B = lora_B_dict[i]
+                delta_weight_trunck.append(weight_B(weight_A(dropout(x))))
+            delta_weight = torch.cat(delta_weight_trunck, dim=2)
+            result += delta_weight * scaling
+
+        result = result.to(previous_dtype)
+        return result  
+          
+def apply_lora_headwiseB():              
+    peft.tuners.lora.layer.LoraLayer.reset_lora_parameters = reset_lora_parameters
+    peft.tuners.lora.layer.LoraLayer.update_layer = update_layer
+    peft.tuners.lora.layer.Linear.get_delta_weight = get_delta_weight
+    peft.tuners.lora.layer.Linear.forward = forward
+    
     
 def main():
     # See all possible arguments in src/transformers/training_args.py
@@ -369,23 +525,46 @@ def main():
         revision=model_args.model_revision,
         use_auth_token=True if model_args.use_auth_token else None,
     )
-    model = AutoModelForSequenceClassification.from_pretrained(
-        model_args.model_name_or_path,
-        from_tf=bool(".ckpt" in model_args.model_name_or_path),
-        config=config,
-        cache_dir=model_args.cache_dir,
-        revision=model_args.model_revision,
-        use_auth_token=True if model_args.use_auth_token else None,
+    model = copy.deepcopy(
+        AutoModelForSequenceClassification.from_pretrained(
+            model_args.model_name_or_path,
+            from_tf=bool(".ckpt" in model_args.model_name_or_path),
+            config=config,
+            cache_dir=model_args.cache_dir,
+            revision=model_args.model_revision,
+            use_auth_token=True if model_args.use_auth_token else None,
+        )
     )
-
+    new_model = copy.deepcopy(
+        AutoModelForSequenceClassification.from_pretrained(
+            model_args.model_name_or_path,
+            from_tf=bool(".ckpt" in model_args.model_name_or_path),
+            config=config,
+            cache_dir=model_args.cache_dir,
+            revision=model_args.model_revision,
+            use_auth_token=True if model_args.use_auth_token else None,
+        )
+    )
+    
     trainable_params = []
-    if model_args.apply_lora:
-        if model_args.lora_path is not None:
-            lora_state_dict = torch.load(model_args.lora_path)
-            logger.info(f"Apply LoRA state dict from {model_args.lora_path}.")
-            logger.info(lora_state_dict.keys())
-            model.load_state_dict(lora_state_dict, strict=False)
-        trainable_params.append('lora')
+#    if model_args.apply_lora:
+#        if model_args.lora_path is not None:
+#            lora_state_dict = torch.load(model_args.lora_path)
+#            logger.info(f"Apply LoRA state dict from {model_args.lora_path}.")
+#            logger.info(lora_state_dict.keys())
+#            model.load_state_dict(lora_state_dict, strict=False)
+#        trainable_params.append('lora')
+
+    if model_args.ex_type == "lora_headwiseB":
+        num_heads = config.num_attention_heads
+        apply_lora_headwiseB()
+        peft_config = peft.LoraConfig(task_type=peft.TaskType.SEQ_CLS, inference_mode=False, r=model_args.lora_r, lora_alpha=model_args.lora_alpha, bias="all")
+        model = peft.get_peft_model(model, peft_config)
+        model.print_trainable_parameters()
+    else:
+        peft_config = peft.LoraConfig(task_type=peft.TaskType.SEQ_CLS, inference_mode=False, r=model_args.lora_r, lora_alpha=model_args.lora_alpha, bias="all")
+        model = peft.get_peft_model(model, peft_config)
+        model.print_trainable_parameters()
 
     if model_args.apply_adapter:
         if model_args.adapter_path is not None:
