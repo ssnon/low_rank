@@ -240,6 +240,8 @@ class ModelArguments:
         default=0.0,
         metadata={"help": "Token Masking Probability"},
     )
+    #ex_type set custom model
+    #if ex_type is set nothing, apply model peft.lora
     ex_type: Optional[str] = field(
         default=None,
     )
