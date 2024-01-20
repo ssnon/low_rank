@@ -66,7 +66,7 @@ import peft
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
 check_min_version("4.4.0")
 
-num_heads = 24
+num_heads = 12
 
 task_to_keys = {
     "cola": ("sentence", None),
@@ -81,8 +81,7 @@ task_to_keys = {
 }
 
 logger = logging.getLogger(__name__)
-
-
+    
 @dataclass
 class DataTrainingArguments:
     """
@@ -246,6 +245,10 @@ class ModelArguments:
     )
     
 def update_layer(self, adapter_name, r, lora_alpha, lora_dropout, init_lora_weights):
+    #redefine function in class LoraLayer
+    #fix base lora layer to headwise lora layer
+    #see original code 'https://github.com/huggingface/peft/blob/main/src/peft/tuners/lora/layer.py'
+        
     if r <= 0:
         raise ValueError(f"`r` should be a positive integer value but the value passed is {r}")
     self.r[adapter_name] = r
@@ -287,6 +290,10 @@ def update_layer(self, adapter_name, r, lora_alpha, lora_dropout, init_lora_weig
     self.set_adapter(self.active_adapters)
     
 def reset_lora_parameters(self, adapter_name, init_lora_weights):
+    #redefine function in class LoraLayer
+    #fix base lora layer initialization for headwise lora layer
+    #see original code 'https://github.com/huggingface/peft/blob/main/src/peft/tuners/lora/layer.py'
+    
     if init_lora_weights is False:
         return
 
@@ -308,6 +315,10 @@ def reset_lora_parameters(self, adapter_name, init_lora_weights):
             nn.init.normal_(self.lora_embedding_B[adapter_name][i])
 
 def get_delta_weight(self, adapter) -> torch.Tensor:
+    #redefine function in class Linear
+    #fix base lora weight compute(matmul A and B) to headwise compute(matmul A and B, and concate them)
+    #see original code 'https://github.com/huggingface/peft/blob/main/src/peft/tuners/lora/layer.py'
+    
     device = self.lora_B[adapter].weight.device
     dtype = self.lora_B[adapter].weight.dtype
 
@@ -342,6 +353,9 @@ def get_delta_weight(self, adapter) -> torch.Tensor:
     return output_tensor    
 
 def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
+    #redefine function in class Linear
+    #fix base lora forward to headwise compute
+    #see original code 'https://github.com/huggingface/peft/blob/main/src/peft/tuners/lora/layer.py'
     previous_dtype = x.dtype
 
     if self.disable_adapters:
@@ -371,7 +385,7 @@ def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
         result = result.to(previous_dtype)
         return result  
           
-def apply_lora_headwiseB():              
+def apply_lora_headwiseB():    
     peft.tuners.lora.layer.LoraLayer.reset_lora_parameters = reset_lora_parameters
     peft.tuners.lora.layer.LoraLayer.update_layer = update_layer
     peft.tuners.lora.layer.Linear.get_delta_weight = get_delta_weight
@@ -382,7 +396,7 @@ def main():
     # See all possible arguments in src/transformers/training_args.py
     # or by passing the --help flag to this script.
     # We now keep distinct sets of args, for a cleaner separation of concerns.
-
+    
     parser = HfArgumentParser((ModelArguments, DataTrainingArguments, TrainingArguments))
     if len(sys.argv) == 2 and sys.argv[1].endswith(".json"):
         # If we pass only one argument to the script and it's the path to a json file,
